@@ -1,0 +1,222 @@
+<!-- ===================================================================
+     SCROLL FRAMES — покадровое "видео по скроллу"
+     Вставить в Tilda в блок T123 (Другое → HTML-код)
+     Единственное, что нужно поменять — строка base: ниже
+     =================================================================== -->
+
+<div class="sfx" id="sfx">
+  <div class="sfx__sticky">
+    <canvas class="sfx__canvas" id="sfx-canvas"></canvas>
+    <div class="sfx__loader" id="sfx-loader">
+      <div class="sfx__bar"><i id="sfx-bar-fill"></i></div>
+    </div>
+  </div>
+</div>
+
+<style>
+.sfx {
+  position: relative;
+  width: 100%;
+  /* высота задаётся из JS (scrollHeight) — это "длина" ролика в скролле */
+}
+.sfx__sticky {
+  position: -webkit-sticky;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  height: 100svh;
+  width: 100%;
+  overflow: hidden;
+  background: #000;
+}
+.sfx__canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.sfx__loader {
+  position: absolute;
+  left: 50%;
+  bottom: 40px;
+  transform: translateX(-50%);
+  width: 160px;
+  opacity: 1;
+  transition: opacity .45s ease;
+  pointer-events: none;
+}
+.sfx__loader.is-done { opacity: 0; }
+.sfx__bar {
+  height: 2px;
+  width: 100%;
+  background: rgba(255,255,255,.25);
+  overflow: hidden;
+}
+.sfx__bar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: #fff;
+  transition: width .2s linear;
+}
+</style>
+
+<script>
+(function () {
+  'use strict';
+
+  var CFG = {
+    // ↓↓↓ ЗАМЕНИ USER и REPO на свои ↓↓↓
+    base:         'https://cdn.jsdelivr.net/gh/USER/REPO@v1/frames/',
+    prefix:       'frame_',
+    ext:          '.jpg',
+    count:        121,   // всего кадров
+    pad:          4,     // frame_0001 → 4 знака
+    scrollHeight: 400,   // "длина" ролика в vh. 400 = 4 экрана скролла
+    smoothing:    0.18,  // плавность догона кадра. 0 = жёстко по скроллу
+    concurrency:  8      // сколько кадров грузим параллельно
+  };
+
+  var root   = document.getElementById('sfx');
+  var canvas = document.getElementById('sfx-canvas');
+  var loader = document.getElementById('sfx-loader');
+  var fill   = document.getElementById('sfx-bar-fill');
+  if (!root || !canvas) return;
+
+  var ctx     = canvas.getContext('2d', { alpha: false });
+  var images  = new Array(CFG.count);
+  var ready   = new Array(CFG.count);
+  var done    = 0;
+  var current = 0;   // отрисованный кадр (дробный, для сглаживания)
+  var target  = 0;   // кадр, которого требует скролл
+  var raf     = null;
+  var cw = 0, ch = 0;
+
+  root.style.height = CFG.scrollHeight + 'vh';
+
+  /* --- Tilda любит вешать overflow:hidden на родителей, что ломает sticky --- */
+  (function unlockSticky() {
+    var el = root.parentNode;
+    while (el && el !== document.body) {
+      if (el.nodeType === 1) {
+        var ov = getComputedStyle(el).overflow;
+        if (ov === 'hidden' || ov === 'clip') el.style.overflow = 'visible';
+      }
+      el = el.parentNode;
+    }
+  })();
+
+  function url(i) {
+    var n = String(i + 1);
+    while (n.length < CFG.pad) n = '0' + n;
+    return CFG.base + CFG.prefix + n + CFG.ext;
+  }
+
+  /* ---------- размер холста под реальный DPR ---------- */
+  function resize() {
+    var r   = canvas.getBoundingClientRect();
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cw = Math.round(r.width  * dpr);
+    ch = Math.round(r.height * dpr);
+    if (canvas.width !== cw || canvas.height !== ch) {
+      canvas.width  = cw;
+      canvas.height = ch;
+    }
+    draw(current, true);
+  }
+
+  /* ---------- отрисовка с object-fit: cover ---------- */
+  function paint(img) {
+    if (!img || !cw || !ch) return;
+    var ir = img.width / img.height;
+    var cr = cw / ch;
+    var sx, sy, sw, sh;
+    if (ir > cr) {                      // картинка шире холста — режем по бокам
+      sh = img.height; sw = sh * cr;
+      sx = (img.width - sw) / 2; sy = 0;
+    } else {                            // картинка выше — режем сверху/снизу
+      sw = img.width;  sh = sw / cr;
+      sx = 0; sy = (img.height - sh) / 2;
+    }
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, cw, ch);
+  }
+
+  /* ближайший уже загруженный кадр — чтобы не было чёрных дыр при скролле */
+  function nearest(i) {
+    if (ready[i]) return i;
+    for (var d = 1; d < CFG.count; d++) {
+      if (i - d >= 0        && ready[i - d]) return i - d;
+      if (i + d < CFG.count && ready[i + d]) return i + d;
+    }
+    return -1;
+  }
+
+  var lastPainted = -1;
+  function draw(frame, force) {
+    var i = nearest(Math.round(frame));
+    if (i < 0) return;
+    if (i === lastPainted && !force) return;
+    lastPainted = i;
+    paint(images[i]);
+  }
+
+  /* ---------- прогресс скролла → номер кадра ---------- */
+  function updateTarget() {
+    var rect  = root.getBoundingClientRect();
+    var total = root.offsetHeight - window.innerHeight;
+    if (total <= 0) { target = 0; return; }
+    var p = (-rect.top) / total;
+    p = p < 0 ? 0 : (p > 1 ? 1 : p);
+    target = p * (CFG.count - 1);
+  }
+
+  function tick() {
+    var diff = target - current;
+    if (Math.abs(diff) < 0.01 || CFG.smoothing <= 0) {
+      current = target;
+      draw(current);
+      raf = null;
+      return;
+    }
+    current += diff * CFG.smoothing;
+    draw(current);
+    raf = requestAnimationFrame(tick);
+  }
+
+  function onScroll() {
+    updateTarget();
+    if (!raf) raf = requestAnimationFrame(tick);
+  }
+
+  /* ---------- загрузка кадров очередью ---------- */
+  var queue = 0;
+  function pump() {
+    while (queue < CFG.count && queue - done < CFG.concurrency) {
+      load(queue++);
+    }
+  }
+  function load(i) {
+    var img = new Image();
+    img.decoding = 'async';
+    img.onload = img.onerror = function () {
+      if (img.naturalWidth) { images[i] = img; ready[i] = true; }
+      done++;
+      fill.style.width = Math.round(done / CFG.count * 100) + '%';
+      if (i === 0) draw(current, true);           // первый кадр — сразу на экран
+      else draw(current);
+      if (done >= CFG.count) loader.classList.add('is-done');
+      pump();
+    };
+    img.src = url(i);
+  }
+
+  /* ---------- старт ---------- */
+  resize();
+  updateTarget();
+  current = target;
+  pump();
+
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+})();
+</script>
